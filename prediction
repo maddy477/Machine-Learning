@@ -1,0 +1,120 @@
+import pandas as pd
+import glob
+import re
+import numpy as np
+import sys
+import nltk
+from nltk.stem import WordNetLemmatizer
+from collections import OrderedDict
+#import xgboost as xgb
+from nltk.corpus import wordnet
+np.set_printoptions(threshold=sys.maxsize)
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+import matplotlib.pyplot as plt
+from sklearn.svm import LinearSVC
+from sklearn.linear_model import SGDClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.metrics import f1_score, roc_curve, auc, confusion_matrix, cohen_kappa_score
+from sklearn.linear_model import LogisticRegression
+import mlflow
+import pickle
+import nltk
+nltk.download('stopwords')
+nltk.download('wordnet')
+nltk.download('averaged_perceptron_tagger')
+from nltk.corpus import stopwords
+stop_words = set(stopwords.words('english'))
+
+# Functions defined for preprocessing 
+
+lemmatizer = WordNetLemmatizer()
+wordnet_map = {"N":wordnet.NOUN, "V":wordnet.VERB, "J":wordnet.ADJ, "R":wordnet.ADV}
+def lemmatize_words(text):
+    pos_tagged_text = nltk.pos_tag(text.split())
+    return " ".join([lemmatizer.lemmatize(word, wordnet_map.get(pos[0], wordnet.NOUN)) for word, pos in pos_tagged_text])
+
+def func(x):
+    y=str(x)
+    y = y.lower()
+    y = re.sub(r'@[a-zA-Z0-9_]+', '', y)
+    y = re.sub(r'https?://[A-Za-z0-9./]+', '', y) 
+    y = re.sub(r'www.[^ ]+', '', y) 
+    y = re.sub(r'[a-zA-Z0-9]*www[a-zA-Z0-9]*com[a-zA-Z0-9]*', '', y) 
+    y = re.sub(r'\d+', ' ', y) 
+    y = re.sub('[()]', ' ', y)
+    y = [token for token in y.split() if len(token) > 2]
+    y = " ".join(sorted(set(y), key=y.index))
+    return y
+    
+####################################################################################
+######### To read multiple csv files from folder and creates a dataframe  ##########
+####################################################################################
+
+path = r'./Data/Chocolate' # use your path
+all_files = glob.glob(path + "/*.csv")
+
+store = []
+
+# pd.read_excel(filename, "sheet name", engine='openpyxl')
+
+for filename in all_files:
+    df = pd.read_csv(filename, index_col=None, header=0)
+    store.append(df)
+
+dff = pd.concat(store, axis=0, ignore_index=True)
+
+# Reading Test Data for predictions
+
+test_df = pd.read_excel('./Data/stackliine_model_test_data.xlsx',engine='openpyxl')
+
+# Removing duplicate title and nulls
+
+test_df = test_df[~test_df.Title.isnull()]
+test_df = test_df.drop_duplicates(subset=['Title'])
+
+test_df
+
+# Running preprocessing steps on test "Title" column
+
+test_df = test_df.apply(lambda x: x.astype(str).str.lower())
+test_df['text'] = test_df['Title'].str.replace("'",'')
+test_df['text'] = test_df['text'].apply(func)
+#test_df["text_lemmatized"] = test_df["text"].apply(lambda text: lemmatize_words(text))
+#test_df['text_lemmatized'] = test_df['text_lemmatized'].str.replace("/",' ')
+test_df['text'] = test_df['text'].apply(lambda x: re.sub('[^A-Za-z0-9]+', ' ', str(x)))
+
+test_df
+
+"""
+    run_id: Run ID needs to be updated as we get new ID everytime we train model
+    model_name: Model name defined in training script
+    
+"""
+run_id = '852d9fd823194b6f364b20e8a67a'
+model_name = 'category_sgd_classifier'
+
+logged_model = 'runs:/{}/{}'.format(run_id, model_name)
+
+# Load model as a PyFuncModel.
+loaded_model = mlflow.sklearn.load_model(logged_model)
+
+# Predict on a Pandas DataFrame.
+
+pred = loaded_model.predict(test_df.text)
+probab = loaded_model.predict_proba(test_df.text)
+
+
+output = pd.DataFrame({'Title':test_df.Title, 'Predicted':pred,'Prob':list(probab)})
+output['Score'] = output['Prob'].apply(max)
+output = output.drop(columns=['Prob'],axis=1)
+
+output
+# Comment out below code to save the output dataframe in csv format to respective path defined 
+
+path = './'
+output.to_csv('{}category_pred.csv'.format(path),index=False)
+
+output.Score.hist()
