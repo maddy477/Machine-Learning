@@ -1,0 +1,202 @@
+import pandas as pd
+import glob
+import re, sklearn, pickle
+import numpy as np
+import mlflow
+import mlflow.sklearn
+from sklearn.pipeline import Pipeline
+from mlflow.models.signature import infer_signature
+import cloudpickle
+from mlflow.utils.environment import _mlflow_conda_env
+import sys
+import nltk
+from nltk.stem import WordNetLemmatizer
+from collections import OrderedDict
+from nltk.corpus import wordnet
+np.set_printoptions(threshold=sys.maxsize)
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+import matplotlib.pyplot as plt
+from sklearn.svm import LinearSVC
+from sklearn.linear_model import SGDClassifier
+#from sklearn.metrics import plot_confusion_matrix
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.metrics import f1_score, roc_curve, auc, confusion_matrix, cohen_kappa_score
+from sklearn.linear_model import LogisticRegression
+nltk.download('stopwords')
+nltk.download('wordnet')
+nltk.download('X:')
+nltk.download('averaged_perceptron_tagger')
+from nltk.corpus import stopwords
+stop_words = set(stopwords.words('english'))
+
+# Hyper parameters and variables
+
+alpha = 1e-5 # can take values from 1e-1 to 1e-10 ideally
+penalty = 'l2' # either l1 or l2
+loss = 'hinge' # hinge, log, huber
+
+target = 'Category'
+model_name_to_be_saved = 'category_sgd_classifier'
+model_run_name = 'category_model'
+input_file_path = '../KT/category_train_data_14may.csv'
+
+lemmatizer = WordNetLemmatizer()
+wordnet_map = {"N":wordnet.NOUN, "V":wordnet.VERB, "J":wordnet.ADJ, "R":wordnet.ADV}
+def lemmatize_words(text):
+    pos_tagged_text = nltk.pos_tag(text.split())
+    return " ".join([lemmatizer.lemmatize(word, wordnet_map.get(pos[0], wordnet.NOUN)) for word, pos in pos_tagged_text])
+
+def func(x):
+    y=str(x)
+    y = y.lower()
+    y = re.sub(r'@[a-zA-Z0-9_]+', '', y)
+    y = re.sub(r'https?://[A-Za-z0-9./]+', '', y) 
+    y = re.sub(r'www.[^ ]+', '', y) 
+    y = re.sub(r'[a-zA-Z0-9]*www[a-zA-Z0-9]*com[a-zA-Z0-9]*', '', y) 
+    y = re.sub(r'\d+', ' ', y) 
+    y = re.sub('[()]', ' ', y)
+    y = [token for token in y.split() if len(token) > 2]
+    y = " ".join(sorted(set(y), key=y.index))
+    return y
+
+# TF-IDF vectorization to convert features to vectors
+tfidf_vect = TfidfVectorizer(analyzer='word', stop_words=stop_words, token_pattern='(?u)\\b\\w\\w+\\b', 
+                             ngram_range=(1, 2),max_features=None, binary=False, norm='l2',
+                             use_idf=True, smooth_idf=True, sublinear_tf=False, min_df= 1) 
+                             
+# Reading input data
+
+data1 = pd.read_csv(input_file_path)
+
+# Selecting Columns required and conveting to lower case
+
+cols = ['Title','Brand','Subcategory','Category']
+data1 = data1[cols]
+data1 = data1.apply(lambda x: x.astype(str).str.lower())
+
+# Dropping duplicated Title from data
+
+data1 = data1.drop_duplicates(subset=['Title'])
+
+# Checking for nulls
+
+print(data1.isnull().any())
+
+# Preprocessing
+
+data1['Brand'] = data1['Brand'].str.replace("'",'')
+
+# List of all unique brand (master_brand)
+master_brand = list(data1.Brand.unique())
+
+data1['title_without_brand'] = [' '.join([y for y in x.split() if y not in master_brand]) for x in data1['Title']]
+data1['title_with_subcategory'] = data1['Title'] + ' ' + data1['Subcategory']
+
+data1['title_without_brand_with_subcategory'] = data1['title_without_brand'] + ' ' + data1['Subcategory']
+data1['title_with_brand'] = np.where(data1.Brand.isin(data1.Title),
+                                     data1['title_with_subcategory'], data1['title_with_subcategory'] + ' ' + data1['Brand'])
+   
+# Creating copy of dataframe
+train_df = data1.copy()
+
+# Edit below line code if you want to reduce class based on value counts
+#train_df = train_df[train_df['Category'].map(train_df['Category'].value_counts()) >= 1000]
+
+train_df['text'] = train_df['Title'].str.replace("'",'')
+train_df['text'] = train_df['text'].apply(func)
+train_df['text'] = train_df['text'].apply(lambda x: re.sub('[^A-Za-z0-9]+', ' ', str(x)))
+
+# Comment on the basis of analysis
+train_df = train_df[train_df['Brand'].map(train_df['Brand'].value_counts()) >= 2]
+
+train_df = train_df[~train_df.text.isnull()]
+
+train_df
+
+# Splitting input and target column variables
+
+labels_brand = train_df[target]
+train_df = train_df.drop(target,axis=1)
+
+# Creation of Train and Test Dataset
+
+x_train, x_test, y_train, y_test = train_test_split(train_df,labels_brand,
+                                                    stratify=train_df.Brand,
+                                                    test_size=0.3,random_state=101)
+    
+print("Train size: {}, Test size: {}".format(x_train.shape[0], x_test.shape[0]))
+
+# Training model and packaging
+
+
+class CustomModel(mlflow.pyfunc.PythonModel):
+    def __init__(self, model):
+        self.model = model
+
+    def predict(self, model_input):
+        return self.model.predict(model_input)
+
+    def predict_proba(self, model_input):
+        return self.model.predict_proba(model_input)
+
+with mlflow.start_run(run_name=model_run_name):
+    
+  #   ct = ColumnTransformer([
+#     ('tfidf', TfidfVectorizer(analyzer='word', stop_words=stop_words, token_pattern='(?u)\\b\\w\\w+\\b', 
+#                              ngram_range=(1, 2),max_features=None, binary=False, norm='l2',
+#                              use_idf=True, smooth_idf=True, sublinear_tf=False, min_df= 1), 'text')])
+    
+    pipe = Pipeline([
+    ('tfidf', TfidfVectorizer(analyzer='word', stop_words=stop_words, token_pattern='(?u)\\b\\w\\w+\\b', 
+                             ngram_range=(1, 2),max_features=None, binary=False, norm='l2',
+                             use_idf=True, smooth_idf=True, sublinear_tf=False, min_df= 1)),
+    ('clf', CalibratedClassifierCV(SGDClassifier(loss=loss, penalty=penalty,alpha=alpha,random_state=101),cv=5))])
+    
+    
+    pipe.fit(x_train.text, y_train)
+  
+    predictions_probab = pipe.predict_proba(x_test.text)
+    predictions_test = pipe.predict(x_test.text)
+    
+  
+    accry = accuracy_score(y_test, predictions_test)
+    f1s = f1_score(y_test, predictions_test,average='macro')
+    precision = precision_score(y_test, predictions_test, average="macro")
+    recal = recall_score(y_test, predictions_test, average="macro")
+    cohen_kappa = cohen_kappa_score(y_test, predictions_test)
+
+    mlflow.log_param("alpha", alpha)
+    mlflow.log_metric("accuracy", accry)
+    mlflow.log_metric("F1", f1s)
+    mlflow.log_metric("precision", precision)
+    mlflow.log_metric("recall", recal)
+    mlflow.log_metric("Cohen kappa",cohen_kappa)
+    wrappedModel = CustomModel(pipe)
+ 
+    signature = infer_signature(x_test.text, y_test)
+  
+  # MLflow contains utilities to create a conda environment used to serve models.
+  # The necessary dependencies are added to a conda.yaml file which is logged along with the model.
+    conda_env =  _mlflow_conda_env(
+        additional_conda_deps=None,
+        additional_pip_deps=["cloudpickle=={}".format(cloudpickle.__version__), "scikit-learn=={}".format(sklearn.__version__)],
+        additional_conda_channels=None,
+    )
+    mlflow.sklearn.log_model(wrappedModel,model_name_to_be_saved, conda_env=conda_env, signature=signature)
+    
+# Run ID to track model
+
+run_id = mlflow.search_runs(filter_string='tags.mlflow.runName = "{}"'.format(model_run_name)).iloc[0].run_id
+print(run_id)
+
+# TO get latest run id from list of run ID's
+
+import os, glob
+directory = './mlruns/0'
+max(glob.glob(os.path.join(directory, '*/')), key=os.path.getmtime)
+
+value = 89
+#print("the value is: {}".format(value))
+print(f"the value is:{value}")
