@@ -1,0 +1,276 @@
+import pandas as pd
+import glob
+import re, sklearn, pickle
+import numpy as np
+import mlflow
+import mlflow.sklearn
+from sklearn.pipeline import Pipeline
+from mlflow.models.signature import infer_signature
+import cloudpickle
+from mlflow.utils.environment import _mlflow_conda_env
+import sys
+import nltk
+from nltk.stem import WordNetLemmatizer
+from collections import OrderedDict
+from nltk.corpus import wordnet
+np.set_printoptions(threshold=sys.maxsize)
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+import matplotlib.pyplot as plt
+from sklearn.svm import LinearSVC
+from sklearn.linear_model import SGDClassifier
+#from sklearn.metrics import plot_confusion_matrix
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.metrics import f1_score, roc_curve, auc, confusion_matrix, cohen_kappa_score
+from sklearn.linear_model import LogisticRegression
+nltk.download('stopwords')
+nltk.download('wordnet')
+nltk.download('X:')
+nltk.download('averaged_perceptron_tagger')
+from nltk.corpus import stopwords
+stop_words = set(stopwords.words('english'))
+
+lemmatizer = WordNetLemmatizer()
+wordnet_map = {"N":wordnet.NOUN, "V":wordnet.VERB, "J":wordnet.ADJ, "R":wordnet.ADV}
+def lemmatize_words(text):
+    pos_tagged_text = nltk.pos_tag(text.split())
+    return " ".join([lemmatizer.lemmatize(word, wordnet_map.get(pos[0], wordnet.NOUN)) for word, pos in pos_tagged_text])
+
+def func(x):
+    y=str(x)
+    y = y.lower()
+    y = re.sub(r'@[a-zA-Z0-9_]+', '', y)
+    y = re.sub(r'https?://[A-Za-z0-9./]+', '', y) 
+    y = re.sub(r'www.[^ ]+', '', y) 
+    y = re.sub(r'[a-zA-Z0-9]*www[a-zA-Z0-9]*com[a-zA-Z0-9]*', '', y) 
+    y = re.sub(r'\d+', ' ', y) 
+    y = re.sub('[()]', ' ', y)
+    y = [token for token in y.split() if len(token) > 2]
+    y = " ".join(sorted(set(y), key=y.index))
+    return y
+
+
+def func1(string):
+    length_string = len(string)
+    f = len(string.split())
+    if f > 3:
+        first_length = round(length_string / 2)
+        first_half = string[0:first_length].lower()
+        return first_half
+    else:
+        return string.lower()
+    
+    
+enc = LabelEncoder()
+
+tfidf_vect = TfidfVectorizer(analyzer='word', stop_words=stop_words, token_pattern='(?u)\\b\\w\\w+\\b', 
+                             ngram_range=(1, 4),max_features=None, binary=False, norm='l2',
+                             use_idf=True, smooth_idf=True, sublinear_tf=False, min_df= 1) 
+                             
+                             #data1 = pd.read_excel('./Mike_data/category_train_data_22june.xlsx','Extract_1',engine='openpyxl')
+data1 = pd.read_csv('./Data/category_train_data_22june.csv')
+
+data1.Category.value_counts()
+
+data1[data1['Brand'].str.contains("Nest",na = False)].Category.value_counts()
+
+data1.head()
+
+cols = ['Title','Brand','Subcategory','Category']
+data1 = data1[cols]
+data1 = data1.apply(lambda x: x.astype(str).str.lower())
+
+#data1 = pd.concat([data1, append_data])
+data1 = data1[~data1.Brand.isnull()]
+
+#new_df = data1.groupby('Category').apply(pd.DataFrame.sample, frac=0.4).reset_index(drop=True)
+
+# label='Category'
+
+# g = data1.groupby(label, group_keys=False)
+# balanced_df = pd.DataFrame(g.apply(lambda x: x.sample(g.size().min()))).reset_index(drop=True)
+
+data1['Brand'] = data1['Brand'].str.replace("'",'')
+
+data1.Category.value_counts()
+
+master_brand = list(data1.Brand.unique())
+data1['title_wo_brand'] = [' '.join([y for y in x.split() if y not in master_brand]) for x in data1['Title']]
+data1['title_w_subcat'] = data1['Title'] + ' ' + data1['Subcategory']
+
+data1['title_wo_barnd_w_subcateg'] = data1['title_wo_brand'] + ' ' + data1['Subcategory']
+data1['title_w_brand'] = np.where(data1.Brand.isin(data1.Title),
+                                     data1['title_w_subcat'], data1['title_w_subcat'] + ' ' + data1['Brand'])
+                                     
+#data1['title_w_brand'] = np.where(data1.Brand.isin(data1.Title), data1['Title'], data1['Title'] + ' ' + data1['Brand'])
+train_df = data1.copy()
+#train_df = train_df[train_df['Category'].map(train_df['Category'].value_counts()) >= 1000]
+train_df['text'] = train_df['title_w_brand'].str.replace("'",'')
+train_df['text'] = train_df['text'].apply(func)
+#train_df["text_lemmatized"] = train_df["text"].apply(lambda text: lemmatize_words(text))
+#train_df['text_lemmatized'] = train_df['text_lemmatized'].str.replace("/",' ')
+train_df['Category'] = train_df['Category'].str.lower()
+train_df['text'] = train_df['text'].apply(lambda x: re.sub('[^A-Za-z0-9]+', ' ', str(x)))
+
+train_df = train_df[train_df['Category'].map(train_df['Category'].value_counts()) >= 1100]
+train_df = train_df[train_df['Brand'].map(train_df['Brand'].value_counts()) >= 2]
+
+train_df = train_df[~train_df.text.isnull()]
+labels_brand = train_df['Category']
+brand_labels = enc.fit_transform(labels_brand.astype(str))
+train_df = train_df.drop('Category',axis=1)
+
+#result
+dff = pd.DataFrame()
+x_train, x_test, y_train, y_test = train_test_split(train_df,brand_labels,
+                                                    stratify=train_df.Brand,
+                                                    test_size=0.2,random_state=101)
+x_train_tfidf_brand = tfidf_vect.fit_transform(x_train.text)
+x_test_tfidf = tfidf_vect.transform(x_test.text)
+    
+print("Train: {}, Test: {}".format(x_train.shape, x_test.shape))
+
+#master_res3 = []
+# for i in [0.3,0.1]:
+def model_param(ip_model, pred_col, score_col):    
+    
+    models = [ip_model
+         #SGDClassifier(loss='hinge', penalty='l2',alpha=1e-5,random_state=99),
+#              LogisticRegression(C=100,penalty='l2',solver='liblinear',random_state=99),
+#              xgb.XGBClassifier(objective= 'multi:softprob',booster='dart',n_estimators=300,learning_rate=0.1
+#                                 ,colsample_bytree=1, verbosity = 0, random_state=99)
+             ]
+    
+    for j in models:
+        j.fit(x_train_tfidf_brand, y_train)
+        calibrator = CalibratedClassifierCV(j ,cv=5)
+        calibrator.fit(x_train_tfidf_brand, y_train)
+
+        predicted = j.predict(x_test_tfidf)
+        dec_func = calibrator.predict_proba(x_test_tfidf)
+        res2 = pd.DataFrame({'Title':x_test.Title,str(pred_col):enc.inverse_transform(predicted),
+                             'Real_Category':enc.inverse_transform(y_test)
+                        ,'Probablity':list(calibrator.predict_proba(x_test_tfidf))})
+        res2[score_col] = res2.Probablity.apply(max)*100
+#         correct_df = res2[res2.Real_Category == res2.Predicted_Category]
+#         incorrect_df = res2[res2.Real_Category != res2.Predicted_Category]
+#         dic = {"Method":'Title with Brand & subcategory',
+#                'train': np.round(1-i,1),
+#                'test':i, 
+#                'model':j,
+#                'Accuracy':np.round(accuracy_score(y_test, predicted)*100,2),
+#                'F1 score':np.round(f1_score(y_test, predicted,average='macro')*100,2),
+#                'Precision':np.round(precision_score(y_test, predicted, average="macro")*100,2),
+#                'Recall':np.round(recall_score(y_test, predicted, average="macro")*100,2),
+#                'Cohen Kappa score':np.round(cohen_kappa_score(y_test, predicted),2),
+#                'total_test':res2.shape[0], 
+#                'Correct':correct_df.shape[0],
+#                'Incorrect':incorrect_df.shape[0],
+#                'Incorrect > 80':incorrect_df[incorrect_df.Score >= 80].shape[0],
+#                'Incorrect > 90':incorrect_df[incorrect_df.Score >= 90].shape[0],
+#                'Confusion matrix':confusion_matrix(y_test, predicted)
+#               }
+#         result.append(dic)
+        #print("model: {}".format(j))
+        #print("train:test: {}:{}".format(1-i,i))
+        print("Accuracy score: {}".format(accuracy_score(y_test, predicted)*100))
+        print("F1 score: {}".format(f1_score(y_test, predicted,average='macro')))
+        print("Precision score: {}".format(precision_score(y_test, predicted, average="macro")))
+        print("Recall score: {}".format(recall_score(y_test, predicted, average="macro")))
+        print("Cohen Kappa score: {}".format(cohen_kappa_score(y_test, predicted)))
+        #plot_confusion_matrix(j, x_test_tfidf, y_test)  
+        #plt.show()  
+        return res2, j, calibrator
+        
+# str(j).split('(')[0]
+sgd_df, sgd_model, calib_model = model_param(SGDClassifier(loss='hinge', penalty='l1',alpha=1e-5,random_state=999),'SGD preds','SGD score')
+
+lg_df, lg_model, cal_model = model_param(LogisticRegression(C=100,penalty='l1',solver='liblinear',random_state=999, max_iter=100), 'Log preds','Log score')
+
+from sklearn.neighbors import KNeighborsClassifier
+knn_df, knn_model, calib_mod = model_param(KNeighborsClassifier(n_neighbors=5,algorithm='brute'),'KNN preds','KNN score')
+
+# Ensemble of Models
+
+# xg_df, xg_model = model_param(xgb.XGBClassifier(objective= 'multi:softprob',booster='dart',n_estimators=300,learning_rate=0.1
+#                                  ,colsample_bytree=1, verbosity = 0, random_state=99), 'XG preds','XG score')
+
+from sklearn.ensemble import VotingClassifier
+from sklearn.model_selection import cross_val_score, RepeatedStratifiedKFold
+
+models = [('lr',lg_model),('svm',sgd_model),('knn',knn_model)]
+ensemble = VotingClassifier(estimators=models, voting='hard')
+
+ensemble.fit(x_train_tfidf_brand, y_train)
+
+vot_pred = ensemble.predict(x_test_tfidf)
+vot_df = pd.DataFrame({'Title':x_test.Title,'vot preds':enc.inverse_transform(vot_pred),'real':enc.inverse_transform(y_test)})
+
+result_df = lg_df.join(sgd_df[['SGD preds','SGD score']]).join(knn_df[['KNN preds','KNN score']]).join(
+    vot_df[['vot preds']])
+result_df = result_df.drop(columns=['Probablity'],axis=1)
+result_df.head()
+
+####### Test Data Additional
+test_ = pd.read_excel('./Data/stackliine_model_test_data.xlsx',engine='openpyxl')
+test_['Title'] = test_['Title'].str.upper()
+data1['Brand'] = data1['Brand'].str.upper()
+#master_brand = list(data1.Brand.unique())
+test_ = test_[~test_['Category'].isnull()]
+#test_['title_wo_brand'] = [' '.join([y for y in x.split() if y not in master_brand]) for x in test_['Title']]
+test_['text'] = test_['Title'].str.replace("'",'')
+test_['text'] = test_['text'].apply(func)
+
+raw = pd.read_csv('./Data/may_25_raw_data.csv')
+raw = raw[['Title','Brand','Subcategory']]
+raw['Title'] = raw['Title'].str.upper()
+
+new_others = test_.merge(raw, on='Title',how='left')
+new_others = new_others.drop_duplicates(subset=['Title'])
+
+new_others
+
+append_data = new_others[['Title','Brand','Subcategory','Category']].copy()
+#append_data = append_data.rename(columns={'Mannual cat':'Category'})
+
+append_data = append_data.apply(lambda x: x.astype(str).str.lower())
+
+append_data
+
+# le_name_mapping = dict(zip(enc.classes_, enc.transform(enc.classes_)))
+# le_name_mapping
+
+y_train
+
+raw = pd.read_excel('./Data/may_25_raw_data.xlsx',engine='openpyxl')
+raw = raw.drop_duplicates()
+
+raw.info()
+
+test = pd.read_csv('./Data/category_additional_training_data_23june.csv')
+
+test['Title'] = test['Title'].str.lower()
+test = test.rename(columns={'Sub category':'Subcategory'})
+test2 = test[['Title','Category']].copy()
+
+test2
+
+raw['Title'] = raw['Title'].str.lower()
+raw['Brand'] = raw['Brand'].str.lower()
+raw['Subcategory'] = raw['Subcategory'].str.lower()
+#raw = raw.apply(lambda x: x.astype(str).str.lower())
+raw.columns
+#raw = raw.apply(lambda x: x.astype(str).str.lower())
+cols = ['Title','Brand','Retail Sales','Units Sold','Retail Price']
+raw2 = raw[cols]
+
+test2
+
+raw2 = raw2.drop_duplicates()
+
+f = test2.merge(raw2, on=['Title'],how='inner')
+
+f = f.drop_duplicates(subset=['Title'])
+
+f.to_excel('./Data/additional_train_data_updated_29June.xlsx')
